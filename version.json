@@ -1,0 +1,633 @@
+import { TRPCError } from "@trpc/server";
+import * as bcrypt from "bcryptjs";
+import * as jose from "jose";
+import { parse as parseCookies } from "cookie";
+import { z } from "zod";
+import { COOKIE_NAME } from "@shared/const";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import {
+  createAthlete,
+  createCalendarEvent,
+  createCircuit,
+  createCircuitAssignment,
+  deactivateAthlete,
+  deleteCalendarEvent,
+  deleteCircuit,
+  deleteCircuitAssignment,
+  deletePaceEntry,
+  deleteWorkout,
+  getAllAthletes,
+  getAllCalendarEvents,
+  getAllCircuitAssignments,
+  getAllCircuits,
+  getAllWorkouts,
+  getAthleteById,
+  getAthleteByUsername,
+  getCalendarEventsForAthlete,
+  getCircuitAssignmentsForAthlete,
+  getMileageForAthlete,
+  getPaceChartForAthlete,
+  getWorkoutById,
+  countWorkouts,
+  createWorkout,
+  setActualMileage,
+  setPlannedMileage,
+  updateAthleteSportMode,
+  updateAthletePassword,
+  hardDeleteAthleteByUsername,
+  upsertPaceEntry,
+  upsertUser,
+  getUserByOpenId,
+} from "./db";
+import { ENV } from "./_core/env";
+
+const ATHLETE_COOKIE = "wd_athlete_session";
+
+// ─── Cookie helper ──────────────────────────────────────────────────────────
+function getAthleteToken(req: { cookies?: Record<string, string>; headers: Record<string, string | string[] | undefined> }): string | undefined {
+  // Try req.cookies first (populated by cookie-parser if present)
+  if (req.cookies?.[ATHLETE_COOKIE]) return req.cookies[ATHLETE_COOKIE];
+  // Fall back to parsing the Cookie header directly
+  const cookieHeader = req.headers["cookie"];
+  if (!cookieHeader) return undefined;
+  const header = Array.isArray(cookieHeader) ? cookieHeader[0] : cookieHeader;
+  const parsed = parseCookies(header ?? "");
+  return parsed[ATHLETE_COOKIE];
+}
+
+// ─── JWT helpers for custom athlete auth ─────────────────────────────────────
+const JWT_SECRET = new TextEncoder().encode(
+  process.env.JWT_SECRET || "westmont-distance-secret-key-2024"
+);
+
+async function signAthleteToken(athleteId: number, role: string) {
+  return new jose.SignJWT({ athleteId, role })
+    .setProtectedHeader({ alg: "HS256" })
+    .setExpirationTime("7d")
+    .sign(JWT_SECRET);
+}
+
+async function verifyAthleteToken(token: string) {
+  try {
+    const { payload } = await jose.jwtVerify(token, JWT_SECRET);
+    return payload as { athleteId: number; role: string };
+  } catch {
+    return null;
+  }
+}
+
+// ─── Admin guard middleware ───────────────────────────────────────────────────
+const adminProcedure = protectedProcedure.use(async ({ ctx, next }) => {
+  // Check if the user is the athlete-admin via cookie
+  const athleteCookie = getAthleteToken(ctx.req);
+  if (athleteCookie) {
+    const payload = await verifyAthleteToken(athleteCookie);
+    if (payload?.role === "admin") {
+      return next({ ctx: { ...ctx, athleteId: payload.athleteId, athleteRole: "admin" } });
+    }
+  }
+  if (ctx.user?.role !== "admin") {
+    throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+  }
+  return next({ ctx });
+});
+
+// ─── Seeding default workouts ─────────────────────────────────────────────────
+const DEFAULT_WORKOUTS = [
+  {
+    title: "8x400m at Goal 1600m Pace",
+    description: "8 repetitions of 400m at your goal 1600m race pace. Take 2 minutes rest between each rep. Focus on consistent splits and smooth form throughout.",
+    type: "track" as const,
+    eventDetails: "1600m event — goal pace training",
+    venue: null,
+    estimatedMiles: 5.0,
+  },
+  {
+    title: "3x1600m at Tempo Effort",
+    description: "3 repetitions of 1600m at comfortably hard tempo effort (approximately 85-90% max effort). Take 3 minutes rest between reps. Builds lactate threshold for 1600m and 3200m events.",
+    type: "track" as const,
+    eventDetails: "1600m / 3200m event — tempo threshold",
+    venue: null,
+    estimatedMiles: 6.0,
+  },
+  {
+    title: "6x800m Descending",
+    description: "6 repetitions of 800m with each rep slightly faster than the last. Take 90 seconds rest between reps. Develops speed endurance critical for 800m and 1600m events.",
+    type: "track" as const,
+    eventDetails: "800m / 1600m event — speed endurance",
+    venue: null,
+    estimatedMiles: 5.5,
+  },
+  {
+    title: "10x200m Fast",
+    description: "10 repetitions of 200m at near-sprint effort. Take 1 minute rest between reps. Sharpens leg turnover and top-end speed for all track events.",
+    type: "track" as const,
+    eventDetails: "800m / 1600m / 3200m — speed sharpener",
+    venue: null,
+    estimatedMiles: 4.0,
+  },
+  {
+    title: "40-Minute Easy Run",
+    description: "40-minute easy aerobic run at conversational pace. Focus on relaxed form and building aerobic base. Great for active recovery and mileage accumulation.",
+    type: "xc" as const,
+    eventDetails: "Cross Country — aerobic base",
+    venue: "Montgomery Hill Park, CA",
+    estimatedMiles: 5.0,
+  },
+  {
+    title: "Long Run 60–70 Min",
+    description: "Long aerobic run of 60 to 70 minutes at easy to moderate effort. Builds endurance and mental toughness on the XC course. Stay relaxed and run the terrain.",
+    type: "xc" as const,
+    eventDetails: "Cross Country — long run endurance",
+    venue: "Crystal Springs Cross Country Course, CA",
+    estimatedMiles: 8.0,
+  },
+  {
+    title: "Hill Repeats – 8x Uphill",
+    description: "8 uphill repetitions at hard effort. Jog back down for recovery. Builds strength, power, and mental toughness essential for cross country racing.",
+    type: "xc" as const,
+    eventDetails: "Cross Country — hill strength",
+    venue: "Crystal Springs Cross Country Course, CA",
+    estimatedMiles: 5.5,
+  },
+];
+
+async function seedDefaultWorkouts() {
+  const count = await countWorkouts();
+  if (count === 0) {
+    for (const w of DEFAULT_WORKOUTS) {
+      await createWorkout({ ...w, isLibrary: true });
+    }
+    console.log("[Seed] Default workouts inserted.");
+  }
+}
+
+// Run seed on startup
+seedDefaultWorkouts().catch(console.error);
+
+// ─── App Router ───────────────────────────────────────────────────────────────
+export const appRouter = router({
+  system: systemRouter,
+
+  // ── OAuth auth (kept for compatibility) ──────────────────────────────────
+  auth: router({
+    me: publicProcedure.query((opts) => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return { success: true } as const;
+    }),
+  }),
+
+  // ── Athlete custom auth ───────────────────────────────────────────────────
+  athleteAuth: router({
+    login: publicProcedure
+      .input(z.object({ username: z.string(), password: z.string() }))
+      .mutation(async ({ input, ctx }) => {
+        const athlete = await getAthleteByUsername(input.username);
+        if (!athlete) {
+          throw new TRPCError({ code: "UNAUTHORIZED", message: "Invalid username or password" });
+        }
+        const valid = await bcrypt.compare(input.password, athlete.passwordHash);
+        if (!valid) {
+          throw new TRPCError({ code: "UNAUTHORIZED", message: "Invalid username or password" });
+        }
+        const token = await signAthleteToken(athlete.id, athlete.role);
+        const isSecure = ctx.req.protocol === "https" || ctx.req.headers["x-forwarded-proto"] === "https";
+        ctx.res.cookie(ATHLETE_COOKIE, token, {
+          httpOnly: true,
+          secure: isSecure,
+          sameSite: isSecure ? "none" : "lax",
+          maxAge: 7 * 24 * 60 * 60 * 1000,
+          path: "/",
+        });
+        return {
+          id: athlete.id,
+          name: athlete.name,
+          username: athlete.username,
+          role: athlete.role,
+          sportMode: athlete.sportMode,
+        };
+      }),
+
+    me: publicProcedure.query(async ({ ctx }) => {
+      const token = getAthleteToken(ctx.req);
+      if (!token) return null;
+      const payload = await verifyAthleteToken(token);
+      if (!payload) return null;
+      const athlete = await getAthleteById(payload.athleteId);
+      if (!athlete || !athlete.isActive) return null;
+      return {
+        id: athlete.id,
+        name: athlete.name,
+        username: athlete.username,
+        role: athlete.role,
+        sportMode: athlete.sportMode,
+      };
+    }),
+
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const isSecure = ctx.req.protocol === "https" || ctx.req.headers["x-forwarded-proto"] === "https";
+      ctx.res.clearCookie(ATHLETE_COOKIE, {
+        httpOnly: true,
+        secure: isSecure,
+        sameSite: isSecure ? "none" : "lax",
+        path: "/",
+        maxAge: -1,
+      });
+      return { success: true };
+    }),
+
+    updateSportMode: publicProcedure
+      .input(z.object({ sportMode: z.enum(["track", "xc"]) }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        if (!token) throw new TRPCError({ code: "UNAUTHORIZED" });
+        const payload = await verifyAthleteToken(token);
+        if (!payload) throw new TRPCError({ code: "UNAUTHORIZED" });
+        await updateAthleteSportMode(payload.athleteId, input.sportMode);
+        return { success: true };
+      }),
+  }),
+
+  // ── Athletes (admin only) ─────────────────────────────────────────────────
+  athletes: router({
+    list: publicProcedure.query(async ({ ctx }) => {
+      // Allow access from athlete-admin cookie
+      const token = getAthleteToken(ctx.req);
+      if (token) {
+        const payload = await verifyAthleteToken(token);
+        if (payload?.role === "admin") return getAllAthletes();
+      }
+      if (ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+      return getAllAthletes();
+    }),
+
+    create: publicProcedure
+      .input(
+        z.object({
+          name: z.string().min(1),
+          username: z.string().min(3),
+          password: z.string().min(6),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+
+        const existing = await getAthleteByUsername(input.username);
+        if (existing) throw new TRPCError({ code: "CONFLICT", message: "Username already taken" });
+
+        const passwordHash = await bcrypt.hash(input.password, 12);
+        await createAthlete({ name: input.name, username: input.username, passwordHash, role: "athlete", sportMode: "track", isActive: true });
+        return { success: true };
+      }),
+
+    remove: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await deactivateAthlete(input.id);
+        return { success: true };
+      }),
+
+    resetPassword: publicProcedure
+      .input(z.object({ id: z.number(), newPassword: z.string().min(6) }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        const passwordHash = await bcrypt.hash(input.newPassword, 12);
+        await updateAthletePassword(input.id, passwordHash);
+        return { success: true };
+      }),
+  }),
+
+  // ── Workouts ──────────────────────────────────────────────────────────────
+  workouts: router({
+    list: publicProcedure.query(async () => getAllWorkouts()),
+
+    create: publicProcedure
+      .input(
+        z.object({
+          title: z.string().min(1),
+          description: z.string().optional(),
+          type: z.enum(["track", "xc", "strength", "general"]),
+          eventDetails: z.string().optional(),
+          venue: z.string().optional(),
+          estimatedMiles: z.number().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await createWorkout({ ...input, isLibrary: true });
+        return { success: true };
+      }),
+
+    delete: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await deleteWorkout(input.id);
+        return { success: true };
+      }),
+  }),
+
+  // ── Calendar ──────────────────────────────────────────────────────────────
+  calendar: router({
+    getForAthlete: publicProcedure
+      .input(z.object({ athleteId: z.number(), startDate: z.string(), endDate: z.string() }))
+      .query(async ({ input }) =>
+        getCalendarEventsForAthlete(input.athleteId, input.startDate, input.endDate)
+      ),
+
+    getAll: publicProcedure
+      .input(z.object({ startDate: z.string(), endDate: z.string() }))
+      .query(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        return getAllCalendarEvents(input.startDate, input.endDate);
+      }),
+
+    create: publicProcedure
+      .input(
+        z.object({
+          athleteId: z.number().nullable().optional(),
+          workoutId: z.number().nullable().optional(),
+          eventDate: z.string(),
+          eventType: z.enum(["workout", "race", "notice"]),
+          title: z.string().min(1),
+          notes: z.string().optional(),
+          venue: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await createCalendarEvent({
+          athleteId: input.athleteId ?? null,
+          workoutId: input.workoutId ?? null,
+          eventDate: input.eventDate as unknown as Date,
+          eventType: input.eventType,
+          title: input.title,
+          notes: input.notes ?? null,
+          venue: input.venue ?? null,
+        });
+        return { success: true };
+      }),
+
+    delete: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await deleteCalendarEvent(input.id);
+        return { success: true };
+      }),
+  }),
+
+  // ── Mileage ───────────────────────────────────────────────────────────────
+  mileage: router({
+    getForAthlete: publicProcedure
+      .input(z.object({ athleteId: z.number() }))
+      .query(async ({ input }) => getMileageForAthlete(input.athleteId)),
+
+    setPlanned: publicProcedure
+      .input(z.object({ athleteId: z.number(), weekStart: z.string(), plannedMiles: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await setPlannedMileage(input.athleteId, input.weekStart, input.plannedMiles);
+        return { success: true };
+      }),
+
+    logActual: publicProcedure
+      .input(z.object({ weekStart: z.string(), actualMiles: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        if (!token) throw new TRPCError({ code: "UNAUTHORIZED" });
+        const payload = await verifyAthleteToken(token);
+        if (!payload) throw new TRPCError({ code: "UNAUTHORIZED" });
+        await setActualMileage(payload.athleteId, input.weekStart, input.actualMiles);
+        return { success: true };
+      }),
+  }),
+
+  // ── Pace Charts ───────────────────────────────────────────────────────────
+  paceCharts: router({
+    getForAthlete: publicProcedure
+      .input(z.object({ athleteId: z.number() }))
+      .query(async ({ input }) => getPaceChartForAthlete(input.athleteId)),
+
+    upsert: publicProcedure
+      .input(
+        z.object({
+          athleteId: z.number(),
+          paceType: z.string().min(1),
+          paceValue: z.string().min(1),
+          notes: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await upsertPaceEntry(input.athleteId, input.paceType, input.paceValue, input.notes);
+        return { success: true };
+      }),
+
+    delete: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await deletePaceEntry(input.id);
+        return { success: true };
+      }),
+  }),
+
+  // ── Circuits (S&C) ────────────────────────────────────────────────────────
+  circuits: router({
+    list: publicProcedure.query(async () => getAllCircuits()),
+
+    create: publicProcedure
+      .input(
+        z.object({
+          title: z.string().min(1),
+          description: z.string().optional(),
+          exercises: z.array(
+            z.object({
+              name: z.string(),
+              sets: z.string().optional(),
+              reps: z.string().optional(),
+              notes: z.string().optional(),
+            })
+          ),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await createCircuit({
+          title: input.title,
+          description: input.description ?? null,
+          exercises: input.exercises,
+        });
+        return { success: true };
+      }),
+
+    delete: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await deleteCircuit(input.id);
+        return { success: true };
+      }),
+
+    getAssignmentsForAthlete: publicProcedure
+      .input(z.object({ athleteId: z.number(), startDate: z.string(), endDate: z.string() }))
+      .query(async ({ input }) =>
+        getCircuitAssignmentsForAthlete(input.athleteId, input.startDate, input.endDate)
+      ),
+
+    getAllAssignments: publicProcedure
+      .input(z.object({ startDate: z.string(), endDate: z.string() }))
+      .query(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        return getAllCircuitAssignments(input.startDate, input.endDate);
+      }),
+
+    assign: publicProcedure
+      .input(
+        z.object({
+          circuitId: z.number(),
+          athleteId: z.number().nullable().optional(),
+          assignedDate: z.string(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await createCircuitAssignment({
+          circuitId: input.circuitId,
+          athleteId: input.athleteId ?? null,
+          assignedDate: input.assignedDate as unknown as Date,
+        });
+        return { success: true };
+      }),
+
+    removeAssignment: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input, ctx }) => {
+        const token = getAthleteToken(ctx.req);
+        let isAdmin = false;
+        if (token) {
+          const payload = await verifyAthleteToken(token);
+          if (payload?.role === "admin") isAdmin = true;
+        }
+        if (!isAdmin && ctx.user?.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" });
+        await deleteCircuitAssignment(input.id);
+        return { success: true };
+      }),
+  }),
+
+  // ── Admin: seed admin account ─────────────────────────────────────────────
+  admin: router({
+    seedAdmin: publicProcedure.mutation(async () => {
+      const existing = await getAthleteByUsername("admin");
+      if (existing) return { message: "Admin already exists" };
+      const passwordHash = await bcrypt.hash("westmont2024", 12);
+      await createAthlete({
+        name: "Coach Admin",
+        username: "admin",
+        passwordHash,
+        role: "admin",
+        sportMode: "track",
+        isActive: true,
+      });
+      return { message: "Admin account created" };
+    }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;

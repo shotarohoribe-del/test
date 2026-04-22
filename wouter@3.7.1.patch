@@ -1,0 +1,76 @@
+CREATE TABLE `athletes` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`name` varchar(128) NOT NULL,
+	`username` varchar(64) NOT NULL,
+	`passwordHash` varchar(256) NOT NULL,
+	`role` enum('athlete','admin') NOT NULL DEFAULT 'athlete',
+	`sportMode` enum('track','xc') NOT NULL DEFAULT 'track',
+	`isActive` boolean NOT NULL DEFAULT true,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `athletes_id` PRIMARY KEY(`id`),
+	CONSTRAINT `athletes_username_unique` UNIQUE(`username`)
+);
+--> statement-breakpoint
+CREATE TABLE `calendarEvents` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`athleteId` int,
+	`workoutId` int,
+	`eventDate` date NOT NULL,
+	`eventType` enum('workout','race','notice') NOT NULL DEFAULT 'workout',
+	`title` varchar(256) NOT NULL,
+	`notes` text,
+	`venue` varchar(256),
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `calendarEvents_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `circuitAssignments` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`circuitId` int NOT NULL,
+	`athleteId` int,
+	`assignedDate` date NOT NULL,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `circuitAssignments_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `circuits` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`title` varchar(256) NOT NULL,
+	`description` text,
+	`exercises` json NOT NULL,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `circuits_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `mileage` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`athleteId` int NOT NULL,
+	`weekStart` date NOT NULL,
+	`plannedMiles` float DEFAULT 0,
+	`actualMiles` float DEFAULT 0,
+	`updatedAt` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `mileage_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `paceCharts` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`athleteId` int NOT NULL,
+	`paceType` varchar(64) NOT NULL,
+	`paceValue` varchar(32) NOT NULL,
+	`notes` text,
+	`updatedAt` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `paceCharts_id` PRIMARY KEY(`id`)
+);
+--> statement-breakpoint
+CREATE TABLE `workouts` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`title` varchar(256) NOT NULL,
+	`description` text,
+	`type` enum('track','xc','strength','general') NOT NULL DEFAULT 'general',
+	`eventDetails` text,
+	`venue` varchar(256),
+	`estimatedMiles` float,
+	`isLibrary` boolean NOT NULL DEFAULT true,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `workouts_id` PRIMARY KEY(`id`)
+);
